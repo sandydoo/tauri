@@ -1677,6 +1677,13 @@ impl<T: UserEvent> WindowDispatch<T> for WryWindowDispatcher<T> {
     id
   }
 
+  fn request_redraw(&self) -> Result<()> {
+    send_user_message(
+      &self.context,
+      Message::Window(self.window_id, WindowMessage::RequestRedraw),
+    )
+  }
+
   // Getters
 
   fn scale_factor(&self) -> Result<f64> {
