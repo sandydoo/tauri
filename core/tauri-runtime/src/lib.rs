@@ -522,6 +522,8 @@ pub trait WindowDispatch<T: UserEvent>: Debug + Clone + Send + Sync + Sized + 's
   /// Registers a window event handler.
   fn on_window_event<F: Fn(&WindowEvent) + Send + 'static>(&self, f: F) -> WindowEventId;
 
+  fn request_redraw(&self) -> Result<()>;
+
   // GETTERS
 
   /// Returns the scale factor that can be used to map logical pixels to physical pixels, and vice versa.

@@ -1001,6 +1001,10 @@ impl<R: Runtime> Window<R> {
     WindowBuilder::new(manager, label.into())
   }
 
+  pub fn request_redraw(&self) {
+    self.window.dispatcher.request_redraw();
+  }
+
   /// Adds a new webview as a child of this window.
   #[cfg(any(test, all(desktop, feature = "unstable")))]
   #[cfg_attr(docsrs, doc(cfg(all(desktop, feature = "unstable"))))]
