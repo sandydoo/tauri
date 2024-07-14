@@ -3313,7 +3313,7 @@ fn handle_event_loop<T: UserEvent>(
     active_tracing_spans,
   } = context;
   if *control_flow != ControlFlow::Exit {
-    *control_flow = ControlFlow::Wait;
+    *control_flow = ControlFlow::Poll;
   }
 
   match event {
