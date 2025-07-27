@@ -331,7 +331,7 @@ fn handle_ipc_message<R: Runtime>(request: Request<String>, manager: &AppManager
                   .expect("unable to serialize response error string to json"),
               };
 
-              let _ = webview.eval(&eval_js);
+              let _ = webview.eval(eval_js);
             }
 
             let can_use_channel_for_response = cmd
@@ -423,7 +423,7 @@ fn handle_ipc_message<R: Runtime>(request: Request<String>, manager: &AppManager
         #[cfg(feature = "tracing")]
         tracing::trace!("ipc.request.error {}", e);
 
-        let _ = webview.eval(&format!(
+        let _ = webview.eval(format!(
           r#"console.error({})"#,
           serde_json::Value::String(e.to_string())
         ));
@@ -440,7 +440,7 @@ fn parse_invoke_request<R: Runtime>(
   let (parts, mut body) = request.into_parts();
 
   // skip leading `/`
-  let cmd = percent_encoding::percent_decode(parts.uri.path()[1..].as_bytes())
+  let cmd = percent_encoding::percent_decode(&parts.uri.path().as_bytes()[1..])
     .decode_utf8_lossy()
     .to_string();
 
@@ -589,7 +589,7 @@ mod tests {
     let invoke_key = "1234ahdsjkl123";
     let callback = 12378123;
     let error = 6243;
-    let headers = HeaderMap::from_iter(vec![
+    let mut headers = HeaderMap::from_iter(vec![
       (
         CONTENT_TYPE,
         HeaderValue::from_str(mime::APPLICATION_OCTET_STREAM.as_ref()).unwrap(),
@@ -629,7 +629,6 @@ mod tests {
       "anotherKey": "asda",
     });
 
-    let mut headers = headers.clone();
     headers.insert(
       CONTENT_TYPE,
       HeaderValue::from_str(mime::APPLICATION_JSON.as_ref()).unwrap(),
@@ -659,7 +658,7 @@ mod tests {
     };
 
     let mut nonce = [0u8; 12];
-    getrandom::getrandom(&mut nonce).unwrap();
+    getrandom::fill(&mut nonce).unwrap();
 
     let body_raw = vec![1, 41, 65, 12, 78];
     let body_bytes = crypto_keys.aes_gcm().encrypt(&nonce, &body_raw).unwrap();

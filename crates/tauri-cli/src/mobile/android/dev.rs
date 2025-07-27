@@ -48,7 +48,7 @@ pub struct Options {
   /// Exit on panic
   #[clap(short, long)]
   exit_on_panic: bool,
-  /// JSON strings or path to JSON files to merge with the default configuration file
+  /// JSON strings or paths to JSON, JSON5 or TOML files to merge with the default configuration file
   ///
   /// Configurations are merged in the order they are provided, which means a particular value overwrites previous values when a config key-value pair conflicts.
   ///
@@ -96,6 +96,11 @@ pub struct Options {
   /// Specify port for the built-in dev server for static files. Defaults to 1430.
   #[clap(long, env = "TAURI_CLI_PORT")]
   pub port: Option<u16>,
+  /// Command line arguments passed to the runner.
+  /// Use `--` to explicitly mark the start of the arguments.
+  /// e.g. `tauri android dev -- [runnerArgs]`.
+  #[clap(last(true))]
+  pub args: Vec<String>,
 }
 
 impl From<Options> for DevOptions {
@@ -106,7 +111,7 @@ impl From<Options> for DevOptions {
       features: options.features,
       exit_on_panic: options.exit_on_panic,
       config: options.config,
-      args: Vec::new(),
+      args: options.args,
       no_watch: options.no_watch,
       no_dev_server_wait: options.no_dev_server_wait,
       no_dev_server: options.no_dev_server,
@@ -157,7 +162,7 @@ fn run_command(options: Options, noise_level: NoiseLevel) -> Result<()> {
     .as_ref()
     .map(|d| d.target().triple.to_string())
     .unwrap_or_else(|| Target::all().values().next().unwrap().triple.into());
-  dev_options.target = Some(target_triple.clone());
+  dev_options.target = Some(target_triple);
 
   let (interface, config, metadata) = {
     let tauri_config_guard = tauri_config.lock().unwrap();
@@ -257,7 +262,7 @@ fn run_dev(
     MobileOptions {
       debug: !options.release_mode,
       features: options.features,
-      args: Vec::new(),
+      args: options.args,
       config: dev_options.config.clone(),
       no_watch: options.no_watch,
     },
@@ -275,10 +280,7 @@ fn run_dev(
         }),
       };
 
-      let _handle = write_options(
-        &tauri_config.lock().unwrap().as_ref().unwrap().identifier,
-        cli_options,
-      )?;
+      let _handle = write_options(tauri_config.lock().unwrap().as_ref().unwrap(), cli_options)?;
 
       inject_resources(config, tauri_config.lock().unwrap().as_ref().unwrap())?;
 

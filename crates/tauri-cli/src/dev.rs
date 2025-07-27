@@ -17,7 +17,7 @@ use crate::{
 use anyhow::{bail, Context};
 use clap::{ArgAction, Parser};
 use shared_child::SharedChild;
-use tauri_utils::platform::Target;
+use tauri_utils::{config::RunnerConfig, platform::Target};
 
 use std::{
   env::set_current_dir,
@@ -49,7 +49,7 @@ pub const TAURI_CLI_BUILTIN_WATCHER_IGNORE_FILE: &[u8] =
 pub struct Options {
   /// Binary to use to run the application
   #[clap(short, long)]
-  pub runner: Option<String>,
+  pub runner: Option<RunnerConfig>,
   /// Target triple to build against
   #[clap(short, long)]
   pub target: Option<String>,
@@ -59,7 +59,7 @@ pub struct Options {
   /// Exit on panic
   #[clap(short, long)]
   pub exit_on_panic: bool,
-  /// JSON strings or path to JSON files to merge with the default configuration file
+  /// JSON strings or paths to JSON, JSON5 or TOML files to merge with the default configuration file
   ///
   /// Configurations are merged in the order they are provided, which means a particular value overwrites previous values when a config key-value pair conflicts.
   ///
@@ -224,9 +224,14 @@ pub fn setup(interface: &AppInterface, options: &mut Options, config: ConfigHand
   }
 
   if options.runner.is_none() {
-    options
+    options.runner = config
+      .lock()
+      .unwrap()
+      .as_ref()
+      .unwrap()
+      .build
       .runner
-      .clone_from(&config.lock().unwrap().as_ref().unwrap().build.runner);
+      .clone();
   }
 
   let mut cargo_features = config

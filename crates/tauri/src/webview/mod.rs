@@ -20,7 +20,7 @@ use tauri_runtime::{
   WindowDispatch,
 };
 use tauri_runtime::{
-  webview::{DetachedWebview, PendingWebview, WebviewAttributes},
+  webview::{DetachedWebview, InitializationScript, PendingWebview, WebviewAttributes},
   WebviewDispatch,
 };
 pub use tauri_utils::config::Color;
@@ -604,7 +604,7 @@ tauri::Builder::default()
 
     let mut pending = self.into_pending_webview(&window, window.label())?;
 
-    pending.webview_attributes.bounds = Some(tauri_runtime::Rect { size, position });
+    pending.webview_attributes.bounds = Some(tauri_runtime::dpi::Rect { size, position });
 
     let use_https_scheme = pending.webview_attributes.use_https_scheme;
 
@@ -634,8 +634,18 @@ impl<R: Runtime> WebviewBuilder<R> {
   /// Adds the provided JavaScript to a list of scripts that should be run after the global object has been created,
   /// but before the HTML document has been parsed and before any other script included by the HTML document is run.
   ///
-  /// Since it runs on all top-level document and child frame page navigations,
+  /// Since it runs on all top-level document navigations,
   /// it's recommended to check the `window.location` to guard your script from running on unexpected origins.
+  ///
+  /// This is executed only on the main frame.
+  /// If you only want to run it in all frames, use [`Self::initialization_script_for_all_frames`] instead.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Windows:** scripts are always added to subframes.
+  /// - **Android:** When [addDocumentStartJavaScript] is not supported,
+  ///   we prepend initialization scripts to each HTML head (implementation only supported on custom protocol URLs).
+  ///   For remote URLs, we use [onPageStarted] which is not guaranteed to run before other scripts.
   ///
   /// # Examples
   ///
@@ -666,12 +676,77 @@ fn main() {
 ```
   "####
   )]
+  ///
+  /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
+  /// [onPageStarted]: https://developer.android.com/reference/android/webkit/WebViewClient#onPageStarted(android.webkit.WebView,%20java.lang.String,%20android.graphics.Bitmap)
   #[must_use]
-  pub fn initialization_script(mut self, script: &str) -> Self {
+  pub fn initialization_script(mut self, script: impl Into<String>) -> Self {
     self
       .webview_attributes
       .initialization_scripts
-      .push(script.to_string());
+      .push(InitializationScript {
+        script: script.into(),
+        for_main_frame_only: true,
+      });
+    self
+  }
+
+  /// Adds the provided JavaScript to a list of scripts that should be run after the global object has been created,
+  /// but before the HTML document has been parsed and before any other script included by the HTML document is run.
+  ///
+  /// Since it runs on all top-level document navigations and also child frame page navigations,
+  /// it's recommended to check the `window.location` to guard your script from running on unexpected origins.
+  ///
+  /// This is executed on all frames (main frame and also sub frames).
+  /// If you only want to run the script in the main frame, use [`Self::initialization_script`] instead.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Android:** When [addDocumentStartJavaScript] is not supported,
+  ///   we prepend initialization scripts to each HTML head (implementation only supported on custom protocol URLs).
+  ///   For remote URLs, we use [onPageStarted] which is not guaranteed to run before other scripts.
+  ///
+  /// # Examples
+  ///
+  #[cfg_attr(
+    feature = "unstable",
+    doc = r####"
+```rust
+use tauri::{WindowBuilder, Runtime};
+
+const INIT_SCRIPT: &str = r#"
+  if (window.location.origin === 'https://tauri.app') {
+    console.log("hello world from js init script");
+
+    window.__MY_CUSTOM_PROPERTY__ = { foo: 'bar' };
+  }
+"#;
+
+fn main() {
+  tauri::Builder::default()
+    .setup(|app| {
+      let window = tauri::window::WindowBuilder::new(app, "label").build()?;
+      let webview_builder = tauri::webview::WebviewBuilder::new("label", tauri::WebviewUrl::App("index.html".into()))
+        .initialization_script_for_all_frames(INIT_SCRIPT);
+      let webview = window.add_child(webview_builder, tauri::LogicalPosition::new(0, 0), window.inner_size().unwrap())?;
+      Ok(())
+    });
+}
+```
+  "####
+  )]
+  ///
+  /// [addDocumentStartJavaScript]: https://developer.android.com/reference/androidx/webkit/WebViewCompat#addDocumentStartJavaScript(android.webkit.WebView,java.lang.String,java.util.Set%3Cjava.lang.String%3E)
+  /// [onPageStarted]: https://developer.android.com/reference/android/webkit/WebViewClient#onPageStarted(android.webkit.WebView,%20java.lang.String,%20android.graphics.Bitmap)
+  #[must_use]
+  pub fn initialization_script_for_all_frames(mut self, script: impl Into<String>) -> Self {
+    self
+      .webview_attributes
+      .initialization_scripts
+      .push(InitializationScript {
+        script: script.into(),
+        for_main_frame_only: false,
+      });
     self
   }
 
@@ -899,6 +974,54 @@ fn main() {
     self.webview_attributes.javascript_disabled = true;
     self
   }
+
+  /// Whether to show a link preview when long pressing on links. Available on macOS and iOS only.
+  ///
+  /// Default is true.
+  ///
+  /// See https://docs.rs/objc2-web-kit/latest/objc2_web_kit/struct.WKWebView.html#method.allowsLinkPreview
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Linux / Windows / Android:** Unsupported.
+  #[cfg(target_os = "macos")]
+  #[must_use]
+  pub fn allow_link_preview(mut self, allow_link_preview: bool) -> Self {
+    self.webview_attributes = self
+      .webview_attributes
+      .allow_link_preview(allow_link_preview);
+    self
+  }
+
+  /// Allows overriding the the keyboard accessory view on iOS.
+  /// Returning `None` effectively removes the view.
+  ///
+  /// The closure parameter is the webview instance.
+  ///
+  /// The accessory view is the view that appears above the keyboard when a text input element is focused.
+  /// It usually displays a view with "Done", "Next" buttons.
+  ///
+  /// # Stability
+  ///
+  /// This relies on [`objc2_ui_kit`] which does not provide a stable API yet, so it can receive breaking changes in minor releases.
+  #[cfg(target_os = "ios")]
+  pub fn with_input_accessory_view_builder<
+    F: Fn(&objc2_ui_kit::UIView) -> Option<objc2::rc::Retained<objc2_ui_kit::UIView>>
+      + Send
+      + Sync
+      + 'static,
+  >(
+    mut self,
+    builder: F,
+  ) -> Self {
+    self
+      .webview_attributes
+      .input_accessory_view_builder
+      .replace(tauri_runtime::webview::InputAccessoryViewBuilder::new(
+        Box::new(builder),
+      ));
+    self
+  }
 }
 
 /// Webview.
@@ -1114,7 +1237,7 @@ impl<R: Runtime> Webview<R> {
   }
 
   /// Resizes this webview.
-  pub fn set_bounds(&self, bounds: tauri_runtime::Rect) -> crate::Result<()> {
+  pub fn set_bounds(&self, bounds: tauri_runtime::dpi::Rect) -> crate::Result<()> {
     self
       .webview
       .dispatcher
@@ -1179,7 +1302,7 @@ impl<R: Runtime> Webview<R> {
   }
 
   /// Returns the bounds of the webviews's client area.
-  pub fn bounds(&self) -> crate::Result<tauri_runtime::Rect> {
+  pub fn bounds(&self) -> crate::Result<tauri_runtime::dpi::Rect> {
     self.webview.dispatcher.bounds().map_err(Into::into)
   }
 
@@ -1374,7 +1497,6 @@ fn main() {
     let resolver = InvokeResolver::new(
       self.clone(),
       Arc::new(Mutex::new(Some(Box::new(
-        #[allow(unused_variables)]
         move |webview: Webview<R>, cmd, response, callback, error| {
           responder(webview, cmd, response, callback, error);
         },
@@ -1522,8 +1644,12 @@ fn main() {
   }
 
   /// Evaluates JavaScript on this window.
-  pub fn eval(&self, js: &str) -> crate::Result<()> {
-    self.webview.dispatcher.eval_script(js).map_err(Into::into)
+  pub fn eval(&self, js: impl Into<String>) -> crate::Result<()> {
+    self
+      .webview
+      .dispatcher
+      .eval_script(js.into())
+      .map_err(Into::into)
   }
 
   /// Register a JS event listener and return its identifier.
@@ -1537,12 +1663,12 @@ fn main() {
 
     let id = listeners.next_event_id();
 
-    self.eval(&crate::event::listen_js_script(
+    self.eval(crate::event::listen_js_script(
       listeners.listeners_object_name(),
       &serde_json::to_string(&target)?,
       event,
       id,
-      &format!("window['_{}']", handler.0),
+      handler,
     ))?;
 
     listeners.listen_js(event, self.label(), target, id);
@@ -1554,19 +1680,13 @@ fn main() {
   pub(crate) fn unlisten_js(&self, event: EventName<&str>, id: EventId) -> crate::Result<()> {
     let listeners = self.manager().listeners();
 
-    self.eval(&crate::event::unlisten_js_script(
-      listeners.listeners_object_name(),
-      event,
-      id,
-    ))?;
-
     listeners.unlisten_js(event, id);
 
     Ok(())
   }
 
   pub(crate) fn emit_js(&self, emit_args: &EmitArgs, ids: &[u32]) -> crate::Result<()> {
-    self.eval(&crate::event::emit_js_script(
+    self.eval(crate::event::emit_js_script(
       self.manager().listeners().function_name(),
       emit_args,
       &serde_json::to_string(ids)?,

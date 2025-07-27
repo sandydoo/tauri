@@ -27,10 +27,7 @@ use crate::{
     UserAttentionType,
   },
 };
-use tauri_utils::{
-  config::{BackgroundThrottlingPolicy, Color, WebviewUrl, WindowConfig},
-  Theme,
-};
+use tauri_utils::config::{BackgroundThrottlingPolicy, Color, WebviewUrl, WindowConfig};
 use url::Url;
 
 use crate::{
@@ -113,7 +110,7 @@ impl<'a, R: Runtime, M: Manager<R>> WebviewWindowBuilder<'a, R, M> {
 
   /// Initializes a webview window builder from a [`WindowConfig`] from tauri.conf.json.
   /// Keep in mind that you can't create 2 windows with the same `label` so make sure
-  /// that the initial window was closed or change the label of the new [`WebviewWindowBuilder`].
+  /// that the initial window was closed or change the label of the cloned [`WindowConfig`].
   ///
   /// # Known issues
   ///
@@ -127,7 +124,24 @@ impl<'a, R: Runtime, M: Manager<R>> WebviewWindowBuilder<'a, R, M> {
   /// ```
   /// #[tauri::command]
   /// async fn reopen_window(app: tauri::AppHandle) {
-  ///   let webview_window = tauri::WebviewWindowBuilder::from_config(&app, &app.config().app.windows.get(0).unwrap().clone())
+  ///   let webview_window = tauri::WebviewWindowBuilder::from_config(&app, &app.config().app.windows.get(0).unwrap())
+  ///     .unwrap()
+  ///     .build()
+  ///     .unwrap();
+  /// }
+  /// ```
+  ///
+  /// - Create a window in a command from a config with a specific label, and change its label so multiple instances can exist:
+  ///
+  /// ```
+  /// #[tauri::command]
+  /// async fn open_window_multiple(app: tauri::AppHandle) {
+  ///   let mut conf = app.config().app.windows.iter().find(|c| c.label == "template-for-multiwindow").unwrap().clone();
+  ///   // This should be a unique label for all windows. For example, we can use a random suffix:
+  ///   let mut buf = [0u8; 1];
+  ///   assert_eq!(getrandom::fill(&mut buf), Ok(()));
+  ///   conf.label = format!("my-multiwindow-{}", buf[0]);
+  ///   let webview_window = tauri::WebviewWindowBuilder::from_config(&app, &conf)
   ///     .unwrap()
   ///     .build()
   ///     .unwrap();
@@ -408,6 +422,34 @@ impl<'a, R: Runtime, M: Manager<R>> WebviewWindowBuilder<'a, R, M> {
     constraints: tauri_runtime::window::WindowSizeConstraints,
   ) -> Self {
     self.window_builder = self.window_builder.inner_size_constraints(constraints);
+    self
+  }
+
+  /// Prevent the window from overflowing the working area (e.g. monitor size - taskbar size)
+  /// on creation, which means the window size will be limited to `monitor size - taskbar size`
+  ///
+  /// **NOTE**: The overflow check is only performed on window creation, resizes can still overflow
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **iOS / Android:** Unsupported.
+  #[must_use]
+  pub fn prevent_overflow(mut self) -> Self {
+    self.window_builder = self.window_builder.prevent_overflow();
+    self
+  }
+
+  /// Prevent the window from overflowing the working area (e.g. monitor size - taskbar size)
+  /// on creation with a margin, which means the window size will be limited to `monitor size - taskbar size - margin size`
+  ///
+  /// **NOTE**: The overflow check is only performed on window creation, resizes can still overflow
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **iOS / Android:** Unsupported.
+  #[must_use]
+  pub fn prevent_overflow_with_margin(mut self, margin: impl Into<Size>) -> Self {
+    self.window_builder = self.window_builder.prevent_overflow_with_margin(margin);
     self
   }
 
@@ -718,6 +760,22 @@ impl<'a, R: Runtime, M: Manager<R>> WebviewWindowBuilder<'a, R, M> {
     self
   }
 
+  /// Whether to show a link preview when long pressing on links. Available on macOS and iOS only.
+  ///
+  /// Default is true.
+  ///
+  /// See https://docs.rs/objc2-web-kit/latest/objc2_web_kit/struct.WKWebView.html#method.allowsLinkPreview
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Linux / Windows / Android:** Unsupported.
+  #[cfg(target_os = "macos")]
+  #[must_use]
+  pub fn allow_link_preview(mut self, allow_link_preview: bool) -> Self {
+    self.webview_builder = self.webview_builder.allow_link_preview(allow_link_preview);
+    self
+  }
+
   /// Hide the window title.
   #[cfg(target_os = "macos")]
   #[must_use]
@@ -765,14 +823,22 @@ impl<R: Runtime, M: Manager<R>> WebviewWindowBuilder<'_, R, M> {
   /// Adds the provided JavaScript to a list of scripts that should be run after the global object has been created,
   /// but before the HTML document has been parsed and before any other script included by the HTML document is run.
   ///
-  /// Since it runs on all top-level document and child frame page navigations,
+  /// Since it runs on all top-level document navigations,
   /// it's recommended to check the `window.location` to guard your script from running on unexpected origins.
+  ///
+  /// This is executed only on the main frame.
+  /// If you only want to run it in all frames, use [Self::initialization_script_for_all_frames] instead.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Windows:** scripts are always added to subframes.
+  /// - **Android:** When [addDocumentStartJavaScript] is not supported,
+  ///   we prepend initialization scripts to each HTML head (implementation only supported on custom protocol URLs).
+  ///   For remote URLs, we use [onPageStarted] which is not guaranteed to run before other scripts.
   ///
   /// # Examples
   ///
   /// ```rust
-  /// use tauri::{WebviewWindowBuilder, Runtime};
-  ///
   /// const INIT_SCRIPT: &str = r#"
   ///   if (window.location.origin === 'https://tauri.app') {
   ///     console.log("hello world from js init script");
@@ -792,8 +858,52 @@ impl<R: Runtime, M: Manager<R>> WebviewWindowBuilder<'_, R, M> {
   /// }
   /// ```
   #[must_use]
-  pub fn initialization_script(mut self, script: &str) -> Self {
+  pub fn initialization_script(mut self, script: impl Into<String>) -> Self {
     self.webview_builder = self.webview_builder.initialization_script(script);
+    self
+  }
+
+  /// Adds the provided JavaScript to a list of scripts that should be run after the global object has been created,
+  /// but before the HTML document has been parsed and before any other script included by the HTML document is run.
+  ///
+  /// Since it runs on all top-level document navigations and also child frame page navigations,
+  /// it's recommended to check the `window.location` to guard your script from running on unexpected origins.
+  ///
+  /// This is executed on all frames (main frame and also sub frames).
+  /// If you only want to run the script in the main frame, use [Self::initialization_script] instead.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Android:** When [addDocumentStartJavaScript] is not supported,
+  ///   we prepend initialization scripts to each HTML head (implementation only supported on custom protocol URLs).
+  ///   For remote URLs, we use [onPageStarted] which is not guaranteed to run before other scripts.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// const INIT_SCRIPT: &str = r#"
+  ///   if (window.location.origin === 'https://tauri.app') {
+  ///     console.log("hello world from js init script");
+  ///
+  ///     window.__MY_CUSTOM_PROPERTY__ = { foo: 'bar' };
+  ///   }
+  /// "#;
+  ///
+  /// fn main() {
+  ///   tauri::Builder::default()
+  ///     .setup(|app| {
+  ///       let webview = tauri::WebviewWindowBuilder::new(app, "label", tauri::WebviewUrl::App("index.html".into()))
+  ///         .initialization_script_for_all_frames(INIT_SCRIPT)
+  ///         .build()?;
+  ///       Ok(())
+  ///     });
+  /// }
+  /// ```
+  #[must_use]
+  pub fn initialization_script_for_all_frames(mut self, script: impl Into<String>) -> Self {
+    self.webview_builder = self
+      .webview_builder
+      .initialization_script_for_all_frames(script);
     self
   }
 
@@ -1015,6 +1125,58 @@ impl<R: Runtime, M: Manager<R>> WebviewWindowBuilder<'_, R, M> {
     self.webview_builder = self.webview_builder.disable_javascript();
     self
   }
+
+  /// Allows overriding the the keyboard accessory view on iOS.
+  /// Returning `None` effectively removes the view.
+  ///
+  /// The closure parameter is the webview instance.
+  ///
+  /// The accessory view is the view that appears above the keyboard when a text input element is focused.
+  /// It usually displays a view with "Done", "Next" buttons.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// fn main() {
+  ///   tauri::Builder::default()
+  ///     .setup(|app| {
+  ///       let mut builder = tauri::WebviewWindowBuilder::new(app, "label", tauri::WebviewUrl::App("index.html".into()));
+  ///       #[cfg(target_os = "ios")]
+  ///       {
+  ///         window_builder = window_builder.with_input_accessory_view_builder(|_webview| unsafe {
+  ///           let mtm = objc2_foundation::MainThreadMarker::new_unchecked();
+  ///           let button = objc2_ui_kit::UIButton::buttonWithType(objc2_ui_kit::UIButtonType(1), mtm);
+  ///           button.setTitle_forState(
+  ///             Some(&objc2_foundation::NSString::from_str("Tauri")),
+  ///             objc2_ui_kit::UIControlState(0),
+  ///           );
+  ///           Some(button.downcast().unwrap())
+  ///         });
+  ///       }
+  ///       let webview = builder.build()?;
+  ///       Ok(())
+  ///     });
+  /// }
+  /// ```
+  ///
+  /// # Stability
+  ///
+  /// This relies on [`objc2_ui_kit`] which does not provide a stable API yet, so it can receive breaking changes in minor releases.
+  #[cfg(target_os = "ios")]
+  pub fn with_input_accessory_view_builder<
+    F: Fn(&objc2_ui_kit::UIView) -> Option<objc2::rc::Retained<objc2_ui_kit::UIView>>
+      + Send
+      + Sync
+      + 'static,
+  >(
+    mut self,
+    builder: F,
+  ) -> Self {
+    self.webview_builder = self
+      .webview_builder
+      .with_input_accessory_view_builder(builder);
+    self
+  }
 }
 
 /// A type that wraps a [`Window`] together with a [`Webview`].
@@ -1072,10 +1234,7 @@ impl<'de, R: Runtime> CommandArg<'de, R> for WebviewWindow<R> {
     let webview = command.message.webview();
     let window = webview.window();
     if window.is_webview_window() {
-      return Ok(Self {
-        window: window.clone(),
-        webview,
-      });
+      return Ok(Self { window, webview });
     }
 
     Err(InvokeError::from("current webview is not a WebviewWindow"))
@@ -1821,8 +1980,13 @@ impl<R: Runtime> WebviewWindow<R> {
     self.window.set_title_bar_style(style)
   }
 
-  /// Set the window theme.
-  pub fn set_theme(&self, theme: Option<Theme>) -> crate::Result<()> {
+  /// Sets the theme for this window.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Linux / macOS**: Theme is app-wide and not specific to this window.
+  /// - **iOS / Android:** Unsupported.
+  pub fn set_theme(&self, theme: Option<tauri_utils::Theme>) -> crate::Result<()> {
     self.window.set_theme(theme)
   }
 }
@@ -1930,7 +2094,7 @@ impl<R: Runtime> WebviewWindow<R> {
   }
 
   /// Evaluates JavaScript on this window.
-  pub fn eval(&self, js: &str) -> crate::Result<()> {
+  pub fn eval(&self, js: impl Into<String>) -> crate::Result<()> {
     self.webview.eval(js)
   }
 

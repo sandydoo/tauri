@@ -153,7 +153,7 @@ impl StateManager {
   pub fn get<T: Send + Sync + 'static>(&self) -> State<'_, T> {
     self
       .try_get()
-      .expect("state: get() when given type is not managed")
+      .unwrap_or_else(|| panic!("state not found for type {}", std::any::type_name::<T>()))
   }
 
   /// Gets the state associated with the specified type.
@@ -189,6 +189,13 @@ mod tests {
     fn drop(&mut self) {
       *self.0.write().unwrap() = true;
     }
+  }
+
+  #[test]
+  #[should_panic(expected = "state not found for type core::option::Option<alloc::string::String>")]
+  fn get_panics() {
+    let state = StateManager::new();
+    state.get::<Option<String>>();
   }
 
   #[test]
@@ -266,7 +273,7 @@ mod tests {
     let dropping_struct = DroppingStruct(drop_flag.clone());
 
     let _drop_flag_ignore = Arc::new(RwLock::new(false));
-    let _dropping_struct_ignore = DroppingStruct(_drop_flag_ignore.clone());
+    let _dropping_struct_ignore = DroppingStruct(_drop_flag_ignore);
 
     state.set::<DroppingStruct>(dropping_struct);
     assert!(!state.set::<DroppingStruct>(_dropping_struct_ignore));

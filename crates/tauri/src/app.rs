@@ -294,9 +294,9 @@ impl<R: Runtime> AssetResolver<R> {
     self.get_for_scheme(path, use_https_scheme)
   }
 
-  ///  Same as [AssetResolver::get] but resolves the custom protocol scheme based on a parameter.
+  ///  Same as [`AssetResolver::get`] but resolves the custom protocol scheme based on a parameter.
   ///
-  /// - `use_https_scheme`: If `true` when using [`Pattern::Isolation`](tauri::Pattern::Isolation),
+  /// - `use_https_scheme`: If `true` when using [`Pattern::Isolation`](crate::Pattern::Isolation),
   ///   the csp header will contain `https://tauri.localhost` instead of `http://tauri.localhost`
   pub fn get_for_scheme(&self, path: String, use_https_scheme: bool) -> Option<Asset> {
     #[cfg(dev)]
@@ -349,6 +349,7 @@ pub struct AppHandle<R: Runtime> {
   event_loop: Arc<Mutex<EventLoop>>,
 }
 
+/// Not the real event loop, only contains the main thread id of the event loop
 #[derive(Debug)]
 struct EventLoop {
   main_thread_id: ThreadId,
@@ -389,8 +390,6 @@ impl<R: Runtime> AppHandle<R> {
   ///
   /// Needs to be called from Main Thread
   pub async fn fetch_data_store_identifiers(&self) -> crate::Result<Vec<[u8; 16]>> {
-    use std::sync::Mutex;
-
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<Vec<[u8; 16]>, tauri_runtime::Error>>();
     let lock: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(Some(tx)));
     let runtime_handle = self.runtime_handle.clone();
@@ -414,8 +413,6 @@ impl<R: Runtime> AppHandle<R> {
   ///
   /// Needs to be called from Main Thread
   pub async fn remove_data_store(&self, uuid: [u8; 16]) -> crate::Result<()> {
-    use std::sync::Mutex;
-
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), tauri_runtime::Error>>();
     let lock: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(Some(tx)));
     let runtime_handle = self.runtime_handle.clone();
@@ -487,10 +484,16 @@ impl<R: Runtime> AppHandle<R> {
   ///     Ok(())
   ///   });
   /// ```
-  #[cfg_attr(feature = "tracing", tracing::instrument(name = "app::plugin::register", skip(plugin), fields(name = plugin.name())))]
   pub fn plugin<P: Plugin<R> + 'static>(&self, plugin: P) -> crate::Result<()> {
-    let mut plugin = Box::new(plugin) as Box<dyn Plugin<R>>;
+    self.plugin_boxed(Box::new(plugin))
+  }
 
+  /// Adds a Tauri application plugin.
+  ///
+  /// This method is similar to [`Self::plugin`],
+  /// but accepts a boxed trait object instead of a generic type.
+  #[cfg_attr(feature = "tracing", tracing::instrument(name = "app::plugin::register", skip(plugin), fields(name = plugin.name())))]
+  pub fn plugin_boxed(&self, mut plugin: Box<dyn Plugin<R>>) -> crate::Result<()> {
     let mut store = self.manager().plugins.lock().unwrap();
     store.initialize(&mut plugin, self, &self.config().plugins)?;
     store.register(plugin);
@@ -598,6 +601,26 @@ impl<R: Runtime> AppHandle<R> {
     self
       .runtime_handle
       .set_activation_policy(activation_policy)
+      .map_err(Into::into)
+  }
+
+  /// Sets the dock visibility for the application.
+  ///
+  /// # Examples
+  /// ```,no_run
+  /// tauri::Builder::default()
+  ///   .setup(move |app| {
+  ///     #[cfg(target_os = "macos")]
+  ///     app.handle().set_dock_visibility(false);
+  ///     Ok(())
+  ///   });
+  /// ```
+  #[cfg(target_os = "macos")]
+  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
+  pub fn set_dock_visibility(&self, visible: bool) -> crate::Result<()> {
+    self
+      .runtime_handle
+      .set_dock_visibility(visible)
       .map_err(Into::into)
   }
 }
@@ -724,7 +747,7 @@ macro_rules! shared_app_impl {
         I: ?Sized,
         TrayIconId: PartialEq<&'a I>,
       {
-        self.manager.tray.tray_by_id(id)
+        self.manager.tray.tray_by_id(self.app_handle(), id)
       }
 
       /// Removes a tray icon using the provided id from tauri's internal state and returns it.
@@ -738,7 +761,7 @@ macro_rules! shared_app_impl {
         I: ?Sized,
         TrayIconId: PartialEq<&'a I>,
       {
-        self.manager.tray.remove_tray_by_id(id)
+        self.manager.tray.remove_tray_by_id(self.app_handle(), id)
       }
 
       /// Gets the app's configuration, defined on the `tauri.conf.json` file.
@@ -807,7 +830,11 @@ macro_rules! shared_app_impl {
         })
       }
 
-      /// Set the app theme.
+      /// Sets the app theme.
+      ///
+      /// ## Platform-specific
+      ///
+      /// - **iOS / Android:** Unsupported.
       pub fn set_theme(&self, theme: Option<Theme>) {
         #[cfg(windows)]
         for window in self.manager.windows().values() {
@@ -1085,7 +1112,7 @@ impl<R: Runtime> App<R> {
   )]
   fn register_core_plugins(&self) -> crate::Result<()> {
     self.handle.plugin(crate::path::plugin::init())?;
-    self.handle.plugin(crate::event::plugin::init())?;
+    self.handle.plugin(crate::event::plugin::init(self))?;
     self.handle.plugin(crate::window::plugin::init())?;
     self.handle.plugin(crate::webview::plugin::init())?;
     self.handle.plugin(crate::app::plugin::init())?;
@@ -1126,6 +1153,27 @@ impl<R: Runtime> App<R> {
       runtime.set_activation_policy(activation_policy);
     } else {
       let _ = self.app_handle().set_activation_policy(activation_policy);
+    }
+  }
+
+  /// Sets the dock visibility for the application.
+  ///
+  /// # Examples
+  /// ```,no_run
+  /// tauri::Builder::default()
+  ///   .setup(move |app| {
+  ///     #[cfg(target_os = "macos")]
+  ///     app.set_dock_visibility(false);
+  ///     Ok(())
+  ///   });
+  /// ```
+  #[cfg(target_os = "macos")]
+  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
+  pub fn set_dock_visibility(&mut self, visible: bool) {
+    if let Some(runtime) = self.runtime.as_mut() {
+      runtime.set_dock_visibility(visible);
+    } else {
+      let _ = self.app_handle().set_dock_visibility(visible);
     }
   }
 
@@ -1180,36 +1228,20 @@ impl<R: Runtime> App<R> {
   ///   _ => {}
   /// });
   /// ```
-  pub fn run<F: FnMut(&AppHandle<R>, RunEvent) + 'static>(mut self, mut callback: F) {
-    let app_handle = self.handle().clone();
-    let manager = self.manager.clone();
+  pub fn run<F: FnMut(&AppHandle<R>, RunEvent) + 'static>(mut self, callback: F) {
+    self.handle.event_loop.lock().unwrap().main_thread_id = std::thread::current().id();
 
-    app_handle.event_loop.lock().unwrap().main_thread_id = std::thread::current().id();
-
-    self.runtime.take().unwrap().run(move |event| match event {
-      RuntimeRunEvent::Ready => {
-        if let Err(e) = setup(&mut self) {
-          panic!("Failed to setup app: {e}");
-        }
-        let event = on_event_loop_event(&app_handle, RuntimeRunEvent::Ready, &manager);
-        callback(&app_handle, event);
-      }
-      RuntimeRunEvent::Exit => {
-        let event = on_event_loop_event(&app_handle, RuntimeRunEvent::Exit, &manager);
-        callback(&app_handle, event);
-        app_handle.cleanup_before_exit();
-        if self.manager.restart_on_exit.load(atomic::Ordering::Relaxed) {
-          crate::process::restart(&self.env());
-        }
-      }
-      _ => {
-        let event = on_event_loop_event(&app_handle, event, &manager);
-        callback(&app_handle, event);
-      }
-    });
+    self
+      .runtime
+      .take()
+      .unwrap()
+      .run(self.make_run_event_loop_callback(callback));
   }
 
   /// Runs the application, returning its intended exit code.
+  ///
+  /// Note when using [`AppHandle::restart`] and [`AppHandle::request_restart`],
+  /// this function will handle the restart request, exit and restart the app without returning
   ///
   /// ## Platform-specific
   ///
@@ -1235,32 +1267,44 @@ impl<R: Runtime> App<R> {
   ///
   /// std::process::exit(exit_code);
   /// ```
-  pub fn run_return<F: FnMut(&AppHandle<R>, RunEvent) + 'static>(mut self, mut callback: F) -> i32 {
-    let manager = self.manager.clone();
-    let app_handle = self.handle().clone();
+  pub fn run_return<F: FnMut(&AppHandle<R>, RunEvent) + 'static>(mut self, callback: F) -> i32 {
+    self.handle.event_loop.lock().unwrap().main_thread_id = std::thread::current().id();
 
     self
       .runtime
       .take()
       .unwrap()
-      .run_return(move |event| match event {
-        RuntimeRunEvent::Ready => {
-          if let Err(e) = setup(&mut self) {
-            panic!("Failed to setup app: {e}");
-          }
-          let event = on_event_loop_event(&app_handle, RuntimeRunEvent::Ready, &manager);
-          callback(&app_handle, event);
+      .run_return(self.make_run_event_loop_callback(callback))
+  }
+
+  fn make_run_event_loop_callback<F: FnMut(&AppHandle<R>, RunEvent) + 'static>(
+    mut self,
+    mut callback: F,
+  ) -> impl FnMut(RuntimeRunEvent<EventLoopMessage>) {
+    let app_handle = self.handle().clone();
+    let manager = self.manager.clone();
+
+    move |event| match event {
+      RuntimeRunEvent::Ready => {
+        if let Err(e) = setup(&mut self) {
+          panic!("Failed to setup app: {e}");
         }
-        RuntimeRunEvent::Exit => {
-          let event = on_event_loop_event(&app_handle, RuntimeRunEvent::Exit, &manager);
-          callback(&app_handle, event);
-          app_handle.cleanup_before_exit();
+        let event = on_event_loop_event(&app_handle, RuntimeRunEvent::Ready, &manager);
+        callback(&app_handle, event);
+      }
+      RuntimeRunEvent::Exit => {
+        let event = on_event_loop_event(&app_handle, RuntimeRunEvent::Exit, &manager);
+        callback(&app_handle, event);
+        app_handle.cleanup_before_exit();
+        if self.manager.restart_on_exit.load(atomic::Ordering::Relaxed) {
+          crate::process::restart(&self.env());
         }
-        _ => {
-          let event = on_event_loop_event(&app_handle, event, &manager);
-          callback(&app_handle, event);
-        }
-      })
+      }
+      _ => {
+        let event = on_event_loop_event(&app_handle, event, &manager);
+        callback(&app_handle, event);
+      }
+    }
   }
 
   /// Runs an iteration of the runtime event loop and immediately return.
@@ -1497,9 +1541,10 @@ impl<R: Runtime> Builder<R> {
   ///
   /// Note that the implementation details is up to your implementation.
   #[must_use]
-  pub fn invoke_system(mut self, initialization_script: String) -> Self {
-    self.invoke_initialization_script =
-      initialization_script.replace("__INVOKE_KEY__", &format!("\"{}\"", self.invoke_key));
+  pub fn invoke_system(mut self, initialization_script: impl AsRef<str>) -> Self {
+    self.invoke_initialization_script = initialization_script
+      .as_ref()
+      .replace("__INVOKE_KEY__", &format!("\"{}\"", self.invoke_key));
     self
   }
 
@@ -1644,8 +1689,17 @@ tauri::Builder::default()
   ///   .plugin(plugin::init());
   /// ```
   #[must_use]
-  pub fn plugin<P: Plugin<R> + 'static>(mut self, plugin: P) -> Self {
-    self.plugins.register(Box::new(plugin));
+  pub fn plugin<P: Plugin<R> + 'static>(self, plugin: P) -> Self {
+    self.plugin_boxed(Box::new(plugin))
+  }
+
+  /// Adds a Tauri application plugin.
+  ///
+  /// This method is similar to [`Self::plugin`],
+  /// but accepts a boxed trait object instead of a generic type.
+  #[must_use]
+  pub fn plugin_boxed(mut self, plugin: Box<dyn Plugin<R>>) -> Self {
+    self.plugins.register(plugin);
     self
   }
 

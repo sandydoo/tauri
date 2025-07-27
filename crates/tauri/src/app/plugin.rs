@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use tauri_utils::Theme;
+use tauri_utils::{config::BundleType, Theme};
 
 use crate::{
   command,
@@ -83,6 +83,38 @@ pub async fn set_app_theme<R: Runtime>(app: AppHandle<R>, theme: Option<Theme>) 
   app.set_theme(theme);
 }
 
+#[command(root = "crate")]
+pub async fn set_dock_visibility<R: Runtime>(
+  app: AppHandle<R>,
+  visible: bool,
+) -> crate::Result<()> {
+  #[cfg(target_os = "macos")]
+  {
+    let mut focused_window = None;
+    for window in app.manager.windows().into_values() {
+      if window.is_focused().unwrap_or_default() {
+        focused_window.replace(window);
+        break;
+      }
+    }
+
+    app.set_dock_visibility(visible)?;
+
+    // retain focus
+    if let Some(focused_window) = focused_window {
+      let _ = focused_window.set_focus();
+    }
+  }
+  #[cfg(not(target_os = "macos"))]
+  let (_app, _visible) = (app, visible);
+  Ok(())
+}
+
+#[command(root = "crate")]
+pub fn bundle_type() -> Option<BundleType> {
+  tauri_utils::platform::bundle_type()
+}
+
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
   Builder::new("app")
     .invoke_handler(crate::generate_handler![
@@ -97,6 +129,8 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
       remove_data_store,
       default_window_icon,
       set_app_theme,
+      set_dock_visibility,
+      bundle_type,
     ])
     .build()
 }

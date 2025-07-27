@@ -12,6 +12,7 @@
   html_favicon_url = "https://github.com/tauri-apps/tauri/raw/dev/.github/icon.png"
 )]
 
+use self::monitor::MonitorExt;
 use http::Request;
 use raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle};
 
@@ -28,7 +29,7 @@ use tauri_runtime::{
   UserAttentionType, UserEvent, WebviewDispatch, WebviewEventId, WindowDispatch, WindowEventId,
 };
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_vendor = "apple")]
 use objc2::rc::Retained;
 #[cfg(target_os = "macos")]
 use tao::platform::macos::{EventLoopWindowTargetExtMacOS, WindowBuilderExtMacOS};
@@ -37,12 +38,14 @@ use tao::platform::unix::{WindowBuilderExtUnix, WindowExtUnix};
 #[cfg(windows)]
 use tao::platform::windows::{WindowBuilderExtWindows, WindowExtWindows};
 #[cfg(windows)]
-use webview2_com::FocusChangedEventHandler;
+use webview2_com::{ContainsFullScreenElementChangedEventHandler, FocusChangedEventHandler};
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
+#[cfg(target_os = "ios")]
+use wry::WebViewBuilderExtIos;
 #[cfg(windows)]
 use wry::WebViewBuilderExtWindows;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_vendor = "apple")]
 use wry::{WebViewBuilderExtDarwin, WebViewExtDarwin};
 
 use tao::{
@@ -63,6 +66,8 @@ use tao::{
     UserAttentionType as TaoUserAttentionType,
   },
 };
+#[cfg(desktop)]
+use tauri_utils::config::PreventOverflowConfig;
 #[cfg(target_os = "macos")]
 use tauri_utils::TitleBarStyle;
 use tauri_utils::{
@@ -125,6 +130,9 @@ use std::{
 pub type WebviewId = u32;
 type IpcHandler = dyn Fn(Request<String>) + 'static;
 
+#[cfg(not(debug_assertions))]
+mod dialog;
+mod monitor;
 #[cfg(any(
   windows,
   target_os = "linux",
@@ -165,7 +173,7 @@ impl WindowIdStore {
     self.0.lock().unwrap().insert(w, id);
   }
 
-  fn get(&self, w: &TaoWindowId) -> Option<WindowId> {
+  pub fn get(&self, w: &TaoWindowId) -> Option<WindowId> {
     self.0.lock().unwrap().get(w).copied()
   }
 }
@@ -242,6 +250,7 @@ pub struct Context<T: UserEvent> {
   next_webview_id: Arc<AtomicU32>,
   next_window_event_id: Arc<AtomicU32>,
   next_webview_event_id: Arc<AtomicU32>,
+  webview_runtime_installed: bool,
 }
 
 impl<T: UserEvent> Context<T> {
@@ -355,7 +364,7 @@ impl<T: UserEvent> Context<T> {
       self,
       Message::CreateWebview(
         window_id,
-        Box::new(move |window| {
+        Box::new(move |window, options| {
           create_webview(
             WebviewKind::WindowChild,
             window,
@@ -363,6 +372,7 @@ impl<T: UserEvent> Context<T> {
             webview_id,
             &context,
             pending,
+            options.focused_webview,
           )
         }),
       ),
@@ -402,7 +412,7 @@ pub enum ActiveTracingSpan {
 }
 
 #[derive(Debug)]
-pub struct WindowsStore(RefCell<BTreeMap<WindowId, WindowWrapper>>);
+pub struct WindowsStore(pub RefCell<BTreeMap<WindowId, WindowWrapper>>);
 
 // SAFETY: we ensure this type is only used on the main thread.
 #[allow(clippy::non_send_fields_in_send_ty)]
@@ -453,8 +463,8 @@ impl From<DeviceEventFilter> for DeviceEventFilterWrapper {
 }
 
 pub struct RectWrapper(pub wry::Rect);
-impl From<tauri_runtime::Rect> for RectWrapper {
-  fn from(value: tauri_runtime::Rect) -> Self {
+impl From<tauri_runtime::dpi::Rect> for RectWrapper {
+  fn from(value: tauri_runtime::dpi::Rect) -> Self {
     RectWrapper(wry::Rect {
       position: value.position,
       size: value.size,
@@ -477,6 +487,59 @@ impl TryFrom<Icon<'_>> for TaoIcon {
 pub struct WindowEventWrapper(pub Option<WindowEvent>);
 
 impl WindowEventWrapper {
+  fn map_from_tao(
+    event: &TaoWindowEvent<'_>,
+    #[allow(unused_variables)] window: &WindowWrapper,
+  ) -> Self {
+    let event = match event {
+      TaoWindowEvent::Resized(size) => WindowEvent::Resized(PhysicalSizeWrapper(*size).into()),
+      TaoWindowEvent::Moved(position) => {
+        WindowEvent::Moved(PhysicalPositionWrapper(*position).into())
+      }
+      TaoWindowEvent::Destroyed => WindowEvent::Destroyed,
+      TaoWindowEvent::ScaleFactorChanged {
+        scale_factor,
+        new_inner_size,
+      } => WindowEvent::ScaleFactorChanged {
+        scale_factor: *scale_factor,
+        new_inner_size: PhysicalSizeWrapper(**new_inner_size).into(),
+      },
+      TaoWindowEvent::Focused(focused) => {
+        #[cfg(not(windows))]
+        return Self(Some(WindowEvent::Focused(*focused)));
+        // on multiwebview mode, if there's no focused webview, it means we're receiving a direct window focus change
+        // (without receiving a webview focus, such as when clicking the taskbar app icon or using Alt + Tab)
+        // in this case we must send the focus change event here
+        #[cfg(windows)]
+        if window.has_children.load(Ordering::Relaxed) {
+          const FOCUSED_WEBVIEW_MARKER: &str = "__tauriWindow?";
+          let mut focused_webview = window.focused_webview.lock().unwrap();
+          // when we focus a webview and the window was previously focused, we get a blur event here
+          // so on blur we should only send events if the current focus is owned by the window
+          if !*focused
+            && focused_webview
+              .as_deref()
+              .is_some_and(|w| w != FOCUSED_WEBVIEW_MARKER)
+          {
+            return Self(None);
+          }
+
+          // reset focused_webview on blur, or set to a dummy value on focus
+          // (to prevent double focus event when we click a webview after focusing a window)
+          *focused_webview = (*focused).then(|| FOCUSED_WEBVIEW_MARKER.to_string());
+
+          return Self(Some(WindowEvent::Focused(*focused)));
+        } else {
+          // when not on multiwebview mode, we handle focus change events on the webview (add_GotFocus and add_LostFocus)
+          return Self(None);
+        }
+      }
+      TaoWindowEvent::ThemeChanged(theme) => WindowEvent::ThemeChanged(map_theme(theme)),
+      _ => return Self(None),
+    };
+    Self(Some(event))
+  }
+
   fn parse(window: &WindowWrapper, event: &TaoWindowEvent<'_>) -> Self {
     match event {
       // resized event from tao doesn't include a reliable size on macOS
@@ -493,7 +556,7 @@ impl WindowEventWrapper {
           Self(None)
         }
       }
-      e => e.into(),
+      e => Self::map_from_tao(e, window),
     }
   }
 }
@@ -516,30 +579,6 @@ fn tao_activation_policy(activation_policy: ActivationPolicy) -> TaoActivationPo
   }
 }
 
-impl<'a> From<&TaoWindowEvent<'a>> for WindowEventWrapper {
-  fn from(event: &TaoWindowEvent<'a>) -> Self {
-    let event = match event {
-      TaoWindowEvent::Resized(size) => WindowEvent::Resized(PhysicalSizeWrapper(*size).into()),
-      TaoWindowEvent::Moved(position) => {
-        WindowEvent::Moved(PhysicalPositionWrapper(*position).into())
-      }
-      TaoWindowEvent::Destroyed => WindowEvent::Destroyed,
-      TaoWindowEvent::ScaleFactorChanged {
-        scale_factor,
-        new_inner_size,
-      } => WindowEvent::ScaleFactorChanged {
-        scale_factor: *scale_factor,
-        new_inner_size: PhysicalSizeWrapper(**new_inner_size).into(),
-      },
-      #[cfg(any(target_os = "linux", target_os = "macos"))]
-      TaoWindowEvent::Focused(focused) => WindowEvent::Focused(*focused),
-      TaoWindowEvent::ThemeChanged(theme) => WindowEvent::ThemeChanged(map_theme(theme)),
-      _ => return Self(None),
-    };
-    Self(Some(event))
-  }
-}
-
 pub struct MonitorHandleWrapper(pub MonitorHandle);
 
 impl From<MonitorHandleWrapper> for Monitor {
@@ -548,6 +587,7 @@ impl From<MonitorHandleWrapper> for Monitor {
       name: monitor.0.name(),
       position: PhysicalPositionWrapper(monitor.0.position()).into(),
       size: PhysicalSizeWrapper(monitor.0.size()).into(),
+      work_area: monitor.0.work_area(),
       scale_factor: monitor.0.scale_factor(),
     }
   }
@@ -731,6 +771,7 @@ impl From<ProgressBarState> for ProgressBarStateWrapper {
 pub struct WindowBuilderWrapper {
   inner: TaoWindowBuilder,
   center: bool,
+  prevent_overflow: Option<Size>,
   #[cfg(target_os = "macos")]
   tabbing_identifier: Option<String>,
 }
@@ -738,7 +779,9 @@ pub struct WindowBuilderWrapper {
 impl std::fmt::Debug for WindowBuilderWrapper {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let mut s = f.debug_struct("WindowBuilderWrapper");
-    s.field("inner", &self.inner).field("center", &self.center);
+    s.field("inner", &self.inner)
+      .field("center", &self.center)
+      .field("prevent_overflow", &self.prevent_overflow);
     #[cfg(target_os = "macos")]
     {
       s.field("tabbing_identifier", &self.tabbing_identifier);
@@ -869,6 +912,15 @@ impl WindowBuilder for WindowBuilderWrapper {
       if let Some(window_classname) = &config.window_classname {
         window = window.window_classname(window_classname);
       }
+
+      if let Some(prevent_overflow) = &config.prevent_overflow {
+        window = match prevent_overflow {
+          PreventOverflowConfig::Enable(true) => window.prevent_overflow(),
+          PreventOverflowConfig::Margin(margin) => window
+            .prevent_overflow_with_margin(TaoPhysicalSize::new(margin.width, margin.height).into()),
+          _ => window,
+        };
+      }
     }
 
     window
@@ -912,6 +964,29 @@ impl WindowBuilder for WindowBuilderWrapper {
       max_width: constraints.max_width,
       max_height: constraints.max_height,
     };
+    self
+  }
+
+  /// Prevent the window from overflowing the working area (e.g. monitor size - taskbar size) on creation
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **iOS / Android:** Unsupported.
+  fn prevent_overflow(mut self) -> Self {
+    self
+      .prevent_overflow
+      .replace(PhysicalSize::new(0, 0).into());
+    self
+  }
+
+  /// Prevent the window from overflowing the working area (e.g. monitor size - taskbar size)
+  /// on creation with a margin
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **iOS / Android:** Unsupported.
+  fn prevent_overflow_with_margin(mut self, margin: Size) -> Self {
+    self.prevent_overflow.replace(margin);
     self
   }
 
@@ -1116,7 +1191,6 @@ impl WindowBuilder for WindowBuilderWrapper {
     self
   }
 
-  #[allow(unused_variables, unused_mut)]
   fn theme(mut self, theme: Option<Theme>) -> Self {
     self.inner = self.inner.with_theme(if let Some(t) = theme {
       match t {
@@ -1329,7 +1403,7 @@ pub enum WebviewMessage {
   Hide,
   SetPosition(Position),
   SetSize(Size),
-  SetBounds(tauri_runtime::Rect),
+  SetBounds(tauri_runtime::dpi::Rect),
   SetFocus,
   Reparent(WindowId, Sender<Result<()>>),
   SetAutoResize(bool),
@@ -1338,7 +1412,7 @@ pub enum WebviewMessage {
   ClearAllBrowsingData,
   // Getters
   Url(Sender<Result<String>>),
-  Bounds(Sender<Result<tauri_runtime::Rect>>),
+  Bounds(Sender<Result<tauri_runtime::dpi::Rect>>),
   Position(Sender<Result<PhysicalPosition<i32>>>),
   Size(Sender<Result<PhysicalSize<u32>>>),
   WithWebview(Box<dyn FnOnce(Webview) + Send>),
@@ -1353,17 +1427,25 @@ pub enum WebviewMessage {
 
 pub enum EventLoopWindowTargetMessage {
   CursorPosition(Sender<Result<PhysicalPosition<f64>>>),
+  SetTheme(Option<Theme>),
 }
 
 pub type CreateWindowClosure<T> =
   Box<dyn FnOnce(&EventLoopWindowTarget<Message<T>>) -> Result<WindowWrapper> + Send>;
 
-pub type CreateWebviewClosure = Box<dyn FnOnce(&Window) -> Result<WebviewWrapper> + Send>;
+pub type CreateWebviewClosure =
+  Box<dyn FnOnce(&Window, CreateWebviewOptions) -> Result<WebviewWrapper> + Send>;
+
+pub struct CreateWebviewOptions {
+  pub focused_webview: Arc<Mutex<Option<String>>>,
+}
 
 pub enum Message<T: 'static> {
   Task(Box<dyn FnOnce() + Send>),
   #[cfg(target_os = "macos")]
   SetActivationPolicy(ActivationPolicy),
+  #[cfg(target_os = "macos")]
+  SetDockVisibility(bool),
   RequestExit(i32),
   Application(ApplicationMessage),
   Window(WindowId, WindowMessage),
@@ -1460,7 +1542,7 @@ impl<T: UserEvent> WebviewDispatch<T> for WryWebviewDispatcher<T> {
     webview_getter!(self, WebviewMessage::Url)?
   }
 
-  fn bounds(&self) -> Result<tauri_runtime::Rect> {
+  fn bounds(&self) -> Result<tauri_runtime::dpi::Rect> {
     webview_getter!(self, WebviewMessage::Bounds)?
   }
 
@@ -1518,7 +1600,7 @@ impl<T: UserEvent> WebviewDispatch<T> for WryWebviewDispatcher<T> {
     )
   }
 
-  fn set_bounds(&self, bounds: tauri_runtime::Rect) -> Result<()> {
+  fn set_bounds(&self, bounds: tauri_runtime::dpi::Rect) -> Result<()> {
     send_user_message(
       &self.context,
       Message::Webview(
@@ -2310,6 +2392,13 @@ pub struct WindowWrapper {
   is_window_transparent: bool,
   #[cfg(windows)]
   surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+  focused_webview: Arc<Mutex<Option<String>>>,
+}
+
+impl WindowWrapper {
+  pub fn label(&self) -> &str {
+    &self.label
+  }
 }
 
 impl fmt::Debug for WindowWrapper {
@@ -2443,6 +2532,11 @@ impl<T: UserEvent> RuntimeHandle<T> for WryHandle<T> {
     )
   }
 
+  #[cfg(target_os = "macos")]
+  fn set_dock_visibility(&self, visible: bool) -> Result<()> {
+    send_user_message(&self.context, Message::SetDockVisibility(visible))
+  }
+
   fn request_exit(&self, code: i32) -> Result<()> {
     // NOTE: request_exit cannot use the `send_user_message` function because it accesses the event loop callback
     self
@@ -2516,15 +2610,10 @@ impl<T: UserEvent> RuntimeHandle<T> for WryHandle<T> {
   }
 
   fn set_theme(&self, theme: Option<Theme>) {
-    self
-      .context
-      .main_thread
-      .window_target
-      .set_theme(match theme {
-        Some(Theme::Light) => Some(TaoTheme::Light),
-        Some(Theme::Dark) => Some(TaoTheme::Dark),
-        _ => None,
-      });
+    let _ = send_user_message(
+      &self.context,
+      Message::EventLoopWindowTarget(EventLoopWindowTargetMessage::SetTheme(theme)),
+    );
   }
 
   #[cfg(target_os = "macos")]
@@ -2633,6 +2722,7 @@ impl<T: UserEvent> Wry<T> {
       next_webview_id: Default::default(),
       next_window_event_id: Default::default(),
       next_webview_event_id: Default::default(),
+      webview_runtime_installed: wry::webview_version().is_ok(),
     };
 
     Ok(Self {
@@ -2761,8 +2851,8 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
       .0
       .borrow()
       .get(&window_id)
-      .and_then(|w| w.inner.clone());
-    if let Some(window) = window {
+      .map(|w| (w.inner.clone(), w.focused_webview.clone()));
+    if let Some((Some(window), focused_webview)) = window {
       let window_id_wrapper = Arc::new(Mutex::new(window_id));
 
       let webview_id = self.context.next_webview_id();
@@ -2774,6 +2864,7 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
         webview_id,
         &self.context,
         pending,
+        focused_webview,
       )?;
 
       #[allow(unknown_lints, clippy::manual_inspect)]
@@ -2831,18 +2922,18 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
   }
 
   fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
-    event_loop_window_getter!(self, EventLoopWindowTargetMessage::CursorPosition)?
+    self
+      .context
+      .main_thread
+      .window_target
+      .cursor_position()
       .map(PhysicalPositionWrapper)
       .map(Into::into)
       .map_err(|_| Error::FailedToGetCursorPosition)
   }
 
   fn set_theme(&self, theme: Option<Theme>) {
-    self.event_loop.set_theme(match theme {
-      Some(Theme::Light) => Some(TaoTheme::Light),
-      Some(Theme::Dark) => Some(TaoTheme::Dark),
-      _ => None,
-    });
+    self.event_loop.set_theme(to_tao_theme(theme));
   }
 
   #[cfg(target_os = "macos")]
@@ -2850,6 +2941,11 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
     self
       .event_loop
       .set_activation_policy(tao_activation_policy(activation_policy));
+  }
+
+  #[cfg(target_os = "macos")]
+  fn set_dock_visibility(&mut self, visible: bool) {
+    self.event_loop.set_dock_visibility(visible);
   }
 
   #[cfg(target_os = "macos")]
@@ -2940,7 +3036,7 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
   }
 
   #[cfg(target_os = "ios")]
-  fn run_return<F: FnMut(RunEvent<T>) + 'static>(mut self, callback: F) -> i32 {
+  fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
     self.run(callback);
     0
   }
@@ -3026,6 +3122,8 @@ fn handle_user_message<T: UserEvent>(
     Message::SetActivationPolicy(activation_policy) => {
       event_loop.set_activation_policy_at_runtime(tao_activation_policy(activation_policy))
     }
+    #[cfg(target_os = "macos")]
+    Message::SetDockVisibility(visible) => event_loop.set_dock_visibility(visible),
     Message::RequestExit(_code) => panic!("cannot handle RequestExit on the main thread"),
     Message::Application(application_message) => match application_message {
       #[cfg(target_os = "macos")]
@@ -3331,11 +3429,7 @@ fn handle_user_message<T: UserEvent>(
             window.set_traffic_light_inset(_position);
           }
           WindowMessage::SetTheme(theme) => {
-            window.set_theme(match theme {
-              Some(Theme::Light) => Some(TaoTheme::Light),
-              Some(Theme::Dark) => Some(TaoTheme::Dark),
-              _ => None,
-            });
+            window.set_theme(to_tao_theme(theme));
           }
           WindowMessage::SetBackgroundColor(color) => {
             window.set_background_color(color.map(Into::into))
@@ -3579,7 +3673,7 @@ fn handle_user_message<T: UserEvent>(
             tx.send(
               webview
                 .bounds()
-                .map(|bounds| tauri_runtime::Rect {
+                .map(|bounds| tauri_runtime::dpi::Rect {
                   size: bounds.size,
                   position: bounds.position,
                 })
@@ -3699,9 +3793,9 @@ fn handle_user_message<T: UserEvent>(
         .0
         .borrow()
         .get(&window_id)
-        .and_then(|w| w.inner.clone());
-      if let Some(window) = window {
-        match handler(&window) {
+        .map(|w| (w.inner.clone(), w.focused_webview.clone()));
+      if let Some((Some(window), focused_webview)) = window {
+        match handler(&window, CreateWebviewOptions { focused_webview }) {
           Ok(webview) => {
             #[allow(unknown_lints, clippy::manual_inspect)]
             windows.0.borrow_mut().get_mut(&window_id).map(|w| {
@@ -3767,6 +3861,7 @@ fn handle_user_message<T: UserEvent>(
             is_window_transparent,
             #[cfg(windows)]
             surface,
+            focused_webview: Default::default(),
           },
         );
         sender.send(Ok(Arc::downgrade(&window))).unwrap();
@@ -3782,6 +3877,9 @@ fn handle_user_message<T: UserEvent>(
           .cursor_position()
           .map_err(|_| Error::FailedToSendMessage);
         sender.send(pos).unwrap();
+      }
+      EventLoopWindowTargetMessage::SetTheme(theme) => {
+        event_loop.set_theme(to_tao_theme(theme));
       }
     },
   }
@@ -4130,56 +4228,85 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
   }
 
   #[cfg(desktop)]
-  if window_builder.center {
+  if window_builder.prevent_overflow.is_some() || window_builder.center {
     let monitor = if let Some(window_position) = &window_builder.inner.window.position {
       event_loop.available_monitors().find(|m| {
         let monitor_pos = m.position();
         let monitor_size = m.size();
 
         // type annotations required for 32bit targets.
-        let window_position: LogicalPosition<i32> = window_position.to_logical(m.scale_factor());
+        let window_position = window_position.to_physical::<i32>(m.scale_factor());
 
         monitor_pos.x <= window_position.x
-          && window_position.x <= monitor_pos.x + monitor_size.width as i32
+          && window_position.x < monitor_pos.x + monitor_size.width as i32
           && monitor_pos.y <= window_position.y
-          && window_position.y <= monitor_pos.y + monitor_size.height as i32
+          && window_position.y < monitor_pos.y + monitor_size.height as i32
       })
     } else {
       event_loop.primary_monitor()
     };
-
     if let Some(monitor) = monitor {
+      let scale_factor = monitor.scale_factor();
       let desired_size = window_builder
         .inner
         .window
         .inner_size
         .unwrap_or_else(|| TaoPhysicalSize::new(800, 600).into());
-      let scale_factor = monitor.scale_factor();
-      #[allow(unused_mut)]
-      let mut window_size = window_builder
+      let mut inner_size = window_builder
         .inner
         .window
         .inner_size_constraints
         .clamp(desired_size, scale_factor)
         .to_physical::<u32>(scale_factor);
+      let mut window_size = inner_size;
+      #[allow(unused_mut)]
+      // Left and right window shadow counts as part of the window on Windows
+      // We need to include it when calculating positions, but not size
+      let mut shadow_width = 0;
       #[cfg(windows)]
-      {
-        if window_builder.inner.window.decorations {
-          use windows::Win32::UI::WindowsAndMessaging::{AdjustWindowRect, WS_OVERLAPPEDWINDOW};
-          let mut rect = windows::Win32::Foundation::RECT::default();
-          let result = unsafe { AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false) };
-          if result.is_ok() {
-            window_size.width += (rect.right - rect.left) as u32;
-            // rect.bottom is made out of shadow, and we don't care about it
-            window_size.height += -rect.top as u32;
-          }
+      if window_builder.inner.window.decorations {
+        use windows::Win32::UI::WindowsAndMessaging::{AdjustWindowRect, WS_OVERLAPPEDWINDOW};
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        let result = unsafe { AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false) };
+        if result.is_ok() {
+          shadow_width = (rect.right - rect.left) as u32;
+          // rect.bottom is made out of shadow, and we don't care about it
+          window_size.height += -rect.top as u32;
         }
       }
-      let position = window::calculate_window_center_position(window_size, monitor);
-      let logical_position = position.to_logical::<f64>(scale_factor);
-      window_builder = window_builder.position(logical_position.x, logical_position.y);
+
+      if let Some(margin) = window_builder.prevent_overflow {
+        let work_area = monitor.work_area();
+        let margin = margin.to_physical::<u32>(scale_factor);
+        let constraint = PhysicalSize::new(
+          work_area.size.width - margin.width,
+          work_area.size.height - margin.height,
+        );
+        if window_size.width > constraint.width || window_size.height > constraint.height {
+          if window_size.width > constraint.width {
+            inner_size.width = inner_size
+              .width
+              .saturating_sub(window_size.width - constraint.width);
+            window_size.width = constraint.width;
+          }
+          if window_size.height > constraint.height {
+            inner_size.height = inner_size
+              .height
+              .saturating_sub(window_size.height - constraint.height);
+            window_size.height = constraint.height;
+          }
+          window_builder.inner.window.inner_size = Some(inner_size.into());
+        }
+      }
+
+      if window_builder.center {
+        window_size.width += shadow_width;
+        let position = window::calculate_window_center_position(window_size, monitor);
+        let logical_position = position.to_logical::<f64>(scale_factor);
+        window_builder = window_builder.position(logical_position.x, logical_position.y);
+      }
     }
-  }
+  };
 
   let window = window_builder.inner.build(event_loop).unwrap();
 
@@ -4227,6 +4354,8 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
 
   let mut webviews = Vec::new();
 
+  let focused_webview = Arc::new(Mutex::new(None));
+
   if let Some(webview) = webview {
     webviews.push(create_webview(
       #[cfg(feature = "unstable")]
@@ -4238,6 +4367,7 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
       webview_id,
       context,
       webview,
+      focused_webview.clone(),
     )?);
   }
 
@@ -4271,6 +4401,7 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
     is_window_transparent,
     #[cfg(windows)]
     surface,
+    focused_webview,
   })
 }
 
@@ -4298,7 +4429,22 @@ fn create_webview<T: UserEvent>(
   id: WebviewId,
   context: &Context<T>,
   pending: PendingWebview<T, Wry<T>>,
+  #[allow(unused_variables)] focused_webview: Arc<Mutex<Option<String>>>,
 ) -> Result<WebviewWrapper> {
+  if !context.webview_runtime_installed {
+    #[cfg(all(not(debug_assertions), windows))]
+    dialog::error(
+      r#"Could not find the WebView2 Runtime.
+
+Make sure it is installed or download it from <A href="https://developer.microsoft.com/en-us/microsoft-edge/webview2">https://developer.microsoft.com/en-us/microsoft-edge/webview2</A>
+
+You may have it installed on another user account, but it is not available for this one.
+"#,
+    );
+
+    return Err(Error::WebviewRuntimeNotInstalled);
+  }
+
   #[allow(unused_mut)]
   let PendingWebview {
     webview_attributes,
@@ -4340,7 +4486,7 @@ fn create_webview<T: UserEvent>(
     }
   };
 
-  let mut webview_builder = WebViewBuilder::with_web_context(&mut web_context.inner)
+  let mut webview_builder = WebViewBuilder::new_with_web_context(&mut web_context.inner)
     .with_id(&label)
     .with_focused(webview_attributes.focus)
     .with_url(&url)
@@ -4544,11 +4690,21 @@ fn create_webview<T: UserEvent>(
     if let Some(data_store_identifier) = &webview_attributes.data_store_identifier {
       webview_builder = webview_builder.with_data_store_identifier(*data_store_identifier);
     }
+
+    webview_builder =
+      webview_builder.with_allow_link_preview(webview_attributes.allow_link_preview);
+  }
+
+  #[cfg(target_os = "ios")]
+  {
+    if let Some(input_accessory_view_builder) = webview_attributes.input_accessory_view_builder {
+      webview_builder = webview_builder
+        .with_input_accessory_view_builder(move |webview| input_accessory_view_builder.0(webview));
+    }
   }
 
   #[cfg(target_os = "macos")]
   {
-    use wry::WebViewBuilderExtDarwin;
     if let Some(position) = &webview_attributes.traffic_light_position {
       webview_builder = webview_builder.with_traffic_light_inset(*position);
     }
@@ -4564,7 +4720,8 @@ fn create_webview<T: UserEvent>(
   ));
 
   for script in webview_attributes.initialization_scripts {
-    webview_builder = webview_builder.with_initialization_script(&script);
+    webview_builder = webview_builder
+      .with_initialization_script_for_main_only(script.script, script.for_main_frame_only);
   }
 
   for (scheme, protocol) in uri_scheme_protocols {
@@ -4675,20 +4832,29 @@ fn create_webview<T: UserEvent>(
   }
 
   #[cfg(windows)]
-  if kind == WebviewKind::WindowContent {
+  {
     let controller = webview.controller();
-    let proxy = context.proxy.clone();
-    let proxy_ = proxy.clone();
+    let proxy_clone = context.proxy.clone();
     let window_id_ = window_id.clone();
     let mut token = 0;
     unsafe {
+      let label_ = label.clone();
+      let focused_webview_ = focused_webview.clone();
       controller.add_GotFocus(
         &FocusChangedEventHandler::create(Box::new(move |_, _| {
-          let _ = proxy.send_event(Message::Webview(
-            *window_id_.lock().unwrap(),
-            id,
-            WebviewMessage::SynthesizedWindowEvent(SynthesizedWindowEvent::Focused(true)),
-          ));
+          let mut focused_webview = focused_webview_.lock().unwrap();
+          // when using multiwebview mode, we should check if the focus change is actually a "webview focus change"
+          // instead of a window focus change (here we're patching window events, so we only care about the actual window changing focus)
+          let already_focused = focused_webview.is_some();
+          focused_webview.replace(label_.clone());
+
+          if !already_focused {
+            let _ = proxy_clone.send_event(Message::Webview(
+              *window_id_.lock().unwrap(),
+              id,
+              WebviewMessage::SynthesizedWindowEvent(SynthesizedWindowEvent::Focused(true)),
+            ));
+          }
           Ok(())
         })),
         &mut token,
@@ -4696,19 +4862,56 @@ fn create_webview<T: UserEvent>(
     }
     .unwrap();
     unsafe {
+      let label_ = label.clone();
+      let window_id_ = window_id.clone();
+      let proxy_clone = context.proxy.clone();
       controller.add_LostFocus(
         &FocusChangedEventHandler::create(Box::new(move |_, _| {
-          let _ = proxy_.send_event(Message::Webview(
-            *window_id.lock().unwrap(),
-            id,
-            WebviewMessage::SynthesizedWindowEvent(SynthesizedWindowEvent::Focused(false)),
-          ));
+          let mut focused_webview = focused_webview.lock().unwrap();
+          // when using multiwebview mode, we should handle webview focus changes
+          // so we check is the currently focused webview matches this webview's
+          // (in this case, it means we lost the window focus)
+          //
+          // on multiwebview mode if we change focus to a different webview
+          // we get the gotFocus event of the other webview before the lostFocus
+          // so this check makes sense
+          let lost_window_focus = focused_webview.as_ref().map_or(true, |w| w == &label_);
+
+          if lost_window_focus {
+            // only reset when we lost window focus - otherwise some other webview is focused
+            *focused_webview = None;
+            let _ = proxy_clone.send_event(Message::Webview(
+              *window_id_.lock().unwrap(),
+              id,
+              WebviewMessage::SynthesizedWindowEvent(SynthesizedWindowEvent::Focused(false)),
+            ));
+          }
           Ok(())
         })),
         &mut token,
       )
     }
     .unwrap();
+
+    if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+      let proxy_clone = context.proxy.clone();
+      unsafe {
+        let _ = webview.add_ContainsFullScreenElementChanged(
+          &ContainsFullScreenElementChangedEventHandler::create(Box::new(move |sender, _| {
+            let mut contains_fullscreen_element = windows::core::BOOL::default();
+            sender
+              .ok_or_else(windows::core::Error::empty)?
+              .ContainsFullScreenElement(&mut contains_fullscreen_element)?;
+            let _ = proxy_clone.send_event(Message::Window(
+              *window_id.lock().unwrap(),
+              WindowMessage::SetFullscreen(contains_fullscreen_element.as_bool()),
+            ));
+            Ok(())
+          })),
+          &mut token,
+        );
+      }
+    }
   }
 
   Ok(WebviewWrapper {
@@ -4778,4 +4981,12 @@ fn inner_size(
   has_children: bool,
 ) -> TaoPhysicalSize<u32> {
   window.inner_size()
+}
+
+fn to_tao_theme(theme: Option<Theme>) -> Option<TaoTheme> {
+  match theme {
+    Some(Theme::Light) => Some(TaoTheme::Light),
+    Some(Theme::Dark) => Some(TaoTheme::Dark),
+    _ => None,
+  }
 }

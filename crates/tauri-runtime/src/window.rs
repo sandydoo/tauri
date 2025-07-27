@@ -267,6 +267,23 @@ pub trait WindowBuilder: WindowBuilderBase {
   #[must_use]
   fn inner_size_constraints(self, constraints: WindowSizeConstraints) -> Self;
 
+  /// Prevent the window from overflowing the working area (e.g. monitor size - taskbar size) on creation
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **iOS / Android:** Unsupported.
+  #[must_use]
+  fn prevent_overflow(self) -> Self;
+
+  /// Prevent the window from overflowing the working area (e.g. monitor size - taskbar size)
+  /// on creation with a margin
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **iOS / Android:** Unsupported.
+  #[must_use]
+  fn prevent_overflow_with_margin(self, margin: dpi::Size) -> Self;
+
   /// Whether the window is resizable or not.
   /// When resizable is set to false, native window's maximize button is automatically disabled.
   #[must_use]
@@ -576,8 +593,7 @@ impl<T: UserEvent, R: Runtime<T>> PartialEq for DetachedWindow<T, R> {
 }
 
 /// A raw window type that contains fields to access
-/// the HWND on Windows, gtk::ApplicationWindow on Linux and
-/// NSView on macOS.
+/// the HWND on Windows, gtk::ApplicationWindow on Linux
 pub struct RawWindow<'a> {
   #[cfg(windows)]
   pub hwnd: isize,

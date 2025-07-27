@@ -32,7 +32,7 @@ fn get_response(
   window_origin: &str,
 ) -> Result<Response<Cow<'static, [u8]>>, Box<dyn std::error::Error>> {
   // skip leading `/`
-  let path = percent_encoding::percent_decode(request.uri().path()[1..].as_bytes())
+  let path = percent_encoding::percent_decode(&request.uri().path().as_bytes()[1..])
     .decode_utf8_lossy()
     .to_string();
 
@@ -225,7 +225,7 @@ fn get_response(
 
 fn random_boundary() -> String {
   let mut x = [0_u8; 30];
-  getrandom::getrandom(&mut x).expect("failed to get random bytes");
+  getrandom::fill(&mut x).expect("failed to get random bytes");
   (x[..])
     .iter()
     .map(|&x| format!("{x:x}"))

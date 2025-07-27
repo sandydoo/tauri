@@ -134,6 +134,12 @@ impl<T: UserEvent> RuntimeHandle<T> for MockRuntimeHandle {
     Ok(())
   }
 
+  #[cfg(target_os = "macos")]
+  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
+  fn set_dock_visibility(&self, visible: bool) -> Result<()> {
+    Ok(())
+  }
+
   fn request_exit(&self, code: i32) -> Result<()> {
     unimplemented!()
   }
@@ -365,6 +371,14 @@ impl WindowBuilder for MockWindowBuilder {
     self
   }
 
+  fn prevent_overflow(self) -> Self {
+    self
+  }
+
+  fn prevent_overflow_with_margin(self, margin: tauri_runtime::dpi::Size) -> Self {
+    self
+  }
+
   fn resizable(self, resizable: bool) -> Self {
     self
   }
@@ -560,8 +574,8 @@ impl<T: UserEvent> WebviewDispatch<T> for MockWebviewDispatcher {
     Ok(self.url.lock().unwrap().clone())
   }
 
-  fn bounds(&self) -> Result<tauri_runtime::Rect> {
-    Ok(tauri_runtime::Rect::default())
+  fn bounds(&self) -> Result<tauri_runtime::dpi::Rect> {
+    Ok(tauri_runtime::dpi::Rect::default())
   }
 
   fn position(&self) -> Result<PhysicalPosition<i32>> {
@@ -592,7 +606,7 @@ impl<T: UserEvent> WebviewDispatch<T> for MockWebviewDispatcher {
     Ok(())
   }
 
-  fn set_bounds(&self, bounds: tauri_runtime::Rect) -> Result<()> {
+  fn set_bounds(&self, bounds: tauri_runtime::dpi::Rect) -> Result<()> {
     Ok(())
   }
 
@@ -1208,6 +1222,10 @@ impl<T: UserEvent> Runtime<T> for MockRuntime {
   #[cfg(target_os = "macos")]
   #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
   fn set_activation_policy(&mut self, activation_policy: tauri_runtime::ActivationPolicy) {}
+
+  #[cfg(target_os = "macos")]
+  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
+  fn set_dock_visibility(&mut self, visible: bool) {}
 
   #[cfg(target_os = "macos")]
   #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]

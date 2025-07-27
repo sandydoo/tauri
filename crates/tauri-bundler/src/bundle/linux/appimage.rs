@@ -27,13 +27,17 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     Arch::Armhf => "armhf",
     target => {
       return Err(crate::Error::ArchError(format!(
-        "Unsupported architecture: {:?}",
-        target
+        "Unsupported architecture: {target:?}"
       )));
     }
   };
 
-  let tools_arch = settings.target().split('-').next().unwrap();
+  let tools_arch = if settings.binary_arch() == Arch::Armhf {
+    "armhf"
+  } else {
+    settings.target().split('-').next().unwrap()
+  };
+
   let output_path = settings.project_out_directory().join("bundle/appimage");
   if output_path.exists() {
     fs::remove_dir_all(&output_path)?;
@@ -181,6 +185,7 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
 
   let mut cmd = Command::new(linuxdeploy_path);
   cmd.env("OUTPUT", &appimage_path);
+  cmd.env("ARCH", tools_arch);
   cmd.args([
     "--appimage-extract-and-run",
     "--verbosity",
@@ -216,7 +221,7 @@ fn prepare_tools(tools_path: &Path, arch: &str) -> crate::Result<PathBuf> {
   let apprun = tools_path.join(format!("AppRun-{arch}"));
   if !apprun.exists() {
     let data = download(&format!(
-      "https://github.com/AppImage/AppImageKit/releases/download/continuous/AppRun-{arch}"
+      "https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-{arch}"
     ))?;
     write_and_make_executable(&apprun, data)?;
   }
