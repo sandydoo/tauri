@@ -9,6 +9,7 @@ use serde::Serialize;
 use serialize_to_javascript::{default_template, Template};
 
 /// The domain of the isolation iframe source.
+#[cfg(feature = "isolation")]
 pub const ISOLATION_IFRAME_SRC_DOMAIN: &str = "localhost";
 
 /// An application pattern.
@@ -62,20 +63,16 @@ impl From<&Pattern> for PatternObject {
 }
 
 /// Where the JavaScript is injected to
-#[derive(Debug, Serialize)]
+#[cfg(feature = "isolation")]
+#[derive(Default, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum IsolationSide {
   /// Original frame, the Brownfield application
+  #[default]
   Original,
   /// Secure frame, the isolation security application
   #[allow(dead_code)]
   Secure,
-}
-
-impl Default for IsolationSide {
-  fn default() -> Self {
-    Self::Original
-  }
 }
 
 #[derive(Template)]

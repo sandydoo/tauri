@@ -8,7 +8,7 @@ use std::{
 };
 use ureq::ResponseExt;
 
-use crate::utils::http_utils::download;
+use crate::utils::http_utils::{base_ureq_agent, download};
 
 pub const WEBVIEW2_BOOTSTRAPPER_URL: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
 pub const WEBVIEW2_OFFLINE_INSTALLER_X86_URL: &str =
@@ -23,24 +23,18 @@ pub const WIX_OUTPUT_FOLDER_NAME: &str = "msi";
 pub const WIX_UPDATER_OUTPUT_FOLDER_NAME: &str = "msi-updater";
 
 pub fn webview2_guid_path(url: &str) -> crate::Result<(String, String)> {
-  let agent: ureq::Agent = ureq::Agent::config_builder()
-    .proxy(ureq::Proxy::try_from_env())
-    .build()
-    .into();
+  let agent = base_ureq_agent();
   let response = agent.head(url).call().map_err(Box::new)?;
   let final_url = response.get_uri().to_string();
   let remaining_url = final_url.strip_prefix(WEBVIEW2_URL_PREFIX).ok_or_else(|| {
-    anyhow::anyhow!(
-      "WebView2 URL prefix mismatch. Expected `{}`, found `{}`.",
-      WEBVIEW2_URL_PREFIX,
-      final_url
-    )
+    crate::Error::GenericError(format!(
+      "WebView2 URL prefix mismatch. Expected `{WEBVIEW2_URL_PREFIX}`, found `{final_url}`."
+    ))
   })?;
   let (guid, filename) = remaining_url.split_once('/').ok_or_else(|| {
-    anyhow::anyhow!(
-      "WebView2 URL format mismatch. Expected `<GUID>/<FILENAME>`, found `{}`.",
-      remaining_url
-    )
+    crate::Error::GenericError(format!(
+      "WebView2 URL format mismatch. Expected `<GUID>/<FILENAME>`, found `{remaining_url}`."
+    ))
   })?;
   Ok((guid.into(), filename.into()))
 }
@@ -70,9 +64,10 @@ pub fn download_webview2_offline_installer(base_path: &Path, arch: &str) -> crat
 }
 
 #[cfg(target_os = "windows")]
-pub fn os_bitness<'a>() -> Option<&'a str> {
+pub fn processor_architecture<'a>() -> Option<&'a str> {
   use windows_sys::Win32::System::SystemInformation::{
-    GetNativeSystemInfo, PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_ARCHITECTURE_INTEL, SYSTEM_INFO,
+    GetNativeSystemInfo, PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_ARCHITECTURE_ARM,
+    PROCESSOR_ARCHITECTURE_ARM64, PROCESSOR_ARCHITECTURE_INTEL, SYSTEM_INFO,
   };
 
   let mut system_info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
@@ -80,80 +75,8 @@ pub fn os_bitness<'a>() -> Option<&'a str> {
   match unsafe { system_info.Anonymous.Anonymous.wProcessorArchitecture } {
     PROCESSOR_ARCHITECTURE_INTEL => Some("x86"),
     PROCESSOR_ARCHITECTURE_AMD64 => Some("x64"),
+    PROCESSOR_ARCHITECTURE_ARM => Some("arm"),
+    PROCESSOR_ARCHITECTURE_ARM64 => Some("arm64"),
     _ => None,
   }
-}
-
-pub fn patch_binary(binary_path: &PathBuf, package_type: &crate::PackageType) -> crate::Result<()> {
-  let file_data = std::fs::read(binary_path)?;
-  let mut file_data = file_data; // make mutable
-
-  let pe = match goblin::Object::parse(&file_data)? {
-    goblin::Object::PE(pe) => pe,
-    _ => {
-      return Err(crate::Error::BinaryParseError(
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "binary is not a PE file").into(),
-      ));
-    }
-  };
-
-  let tauri_bundle_section = pe
-    .sections
-    .iter()
-    .find(|s| s.name().unwrap_or_default() == ".taubndl")
-    .ok_or(crate::Error::MissingBundleTypeVar)?;
-
-  let data_offset = tauri_bundle_section.pointer_to_raw_data as usize;
-
-  if data_offset + 8 > file_data.len() {
-    return Err(crate::Error::BinaryOffsetOutOfRange);
-  }
-
-  let ptr_bytes = &file_data[data_offset..data_offset + 8];
-  let ptr_value = u64::from_le_bytes(ptr_bytes.try_into().map_err(|_| {
-    crate::Error::BinaryParseError(
-      std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid pointer bytes").into(),
-    )
-  })?);
-
-  let rdata_section = pe
-    .sections
-    .iter()
-    .find(|s| s.name().unwrap_or_default() == ".rdata")
-    .ok_or_else(|| {
-      crate::Error::BinaryParseError(
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, ".rdata section not found").into(),
-      )
-    })?;
-
-  let rva = ptr_value.checked_sub(pe.image_base as u64).ok_or_else(|| {
-    crate::Error::BinaryParseError(
-      std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid RVA offset").into(),
-    )
-  })?;
-
-  let file_offset = rdata_section.pointer_to_raw_data as usize
-    + (rva as usize).saturating_sub(rdata_section.virtual_address as usize);
-
-  if file_offset + 3 > file_data.len() {
-    return Err(crate::Error::BinaryOffsetOutOfRange);
-  }
-
-  // Overwrite the string at that offset
-  let string_bytes = &mut file_data[file_offset..file_offset + 3];
-  match package_type {
-    crate::PackageType::Nsis => string_bytes.copy_from_slice(b"NSS"),
-    crate::PackageType::WindowsMsi => string_bytes.copy_from_slice(b"MSI"),
-    _ => {
-      return Err(crate::Error::InvalidPackageType(
-        package_type.short_name().to_owned(),
-        "windows".to_owned(),
-      ));
-    }
-  }
-
-  std::fs::write(binary_path, &file_data)
-    .map_err(|e| crate::Error::BinaryWriteError(e.to_string()))?;
-
-  Ok(())
 }
